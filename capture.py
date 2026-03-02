@@ -17,24 +17,19 @@ from skimage.metrics import structural_similarity as ssim
 PORT        = 12345
 ESP_W, ESP_H = 320, 240          # ← New resolution (ILI9341 landscape)
 
-# Frame size cap: set high — we don't know the ESP's exact limit yet.
-# The FEC + chunking system will handle whatever size we send.
-# Lower this later once you've measured real performance on the S3.
-MAX_FRAME_SIZE = 65000           # ~64 KB soft cap; raise if needed
+# Tile constants — MUST match main.cpp
+CHUNK_DATA_SIZE  = 1400   # bytes of JPEG payload per UDP packet
+NUM_TILES        = 4
+TILE_W, TILE_H   = 160, 120
 
-# UDP / FEC constants — MUST match main.cpp
-CHUNK_DATA_SIZE  = 1400          # bytes of JPEG data per UDP packet
-FEC_GROUP_SIZE   = 4             # 1 parity per 4 data chunks = 25% overhead
-                                  # smaller groups → survives bursty WiFi losses better
-MAX_UDP_PACKET   = CHUNK_DATA_SIZE + 16   # header overhead headroom
+# Tile layout (x, y offsets in the 320x240 frame):
+#   [0: TL]  [1: TR]
+#   [2: BL]  [3: BR]
+TILE_X = [  0, 160,   0, 160]
+TILE_Y = [  0,   0, 120, 120]
 
-# Inter-packet pacing — the single biggest fix for ESP32 UDP overflow.
-# capture.py sends chunks in a tight burst; default socket kernel can do it
-# in <1ms for a 20-chunk frame. The ESP32's lwIP recv queue holds ~45 packets
-# but bursts can still cause loss on the AP side.
-# 300µs default = 20 chunks spread over 6ms instead of <0.5ms.
-# Adjustable via trackbar in the UI.
-CHUNK_PACING_S   = 0.0003        # 300 µs default inter-packet delay
+# Per-tile JPEG size cap. 160x120 at quality 95 is ~12 KB worst case.
+MAX_TILE_JPEG = 33600   # 24 × 1400 — matches MAX_TILE_CHUNKS in main.cpp
 
 DEFAULT_FPS   = 30
 WINDOW_NAME   = "Stream Control"
@@ -120,76 +115,61 @@ def get_scene_key(frame_small):
 # ─────────────────────────────────────────────
 #  FEC CHUNKING
 # ─────────────────────────────────────────────
-def _xor_parity(chunks: list[bytes]) -> bytes:
-    """XOR all chunks (zero-padded to CHUNK_DATA_SIZE) → parity block.
-    Uses numpy for vectorised XOR — ~100x faster than Python byte loop."""
-    parity = np.zeros(CHUNK_DATA_SIZE, dtype=np.uint8)
-    for chunk in chunks:
-        arr = np.frombuffer(chunk, dtype=np.uint8)
-        if len(arr) < CHUNK_DATA_SIZE:
-            arr = np.pad(arr, (0, CHUNK_DATA_SIZE - len(arr)))
-        parity ^= arr
-    return bytes(parity)
 
-
-def send_frame_with_fec(sock: socket.socket, target_ip: str, jpeg_bytes: bytes,
-                        pacing_s: float = 0.0):
+def send_tiles(sock: socket.socket, target_ip: str, frame_bgr: np.ndarray,
+               quality: int, sub_flag: int, pacing_s: float = 0.0):
     """
-    Split jpeg_bytes into CHUNK_DATA_SIZE chunks and send with interleaved FEC parity.
+    Split the 320x240 frame into 4 independent 160x120 tiles, encode each
+    as a separate JPEG, and send each tile's chunks independently.
 
-    KEY IMPROVEMENT over old version:
-    - Parity is interleaved (sent after each group) instead of appended at end.
-      If the ESP32's AP/socket buffer overflows on a large burst, the old approach
-      lost ALL parity (it was at the tail). Interleaved means each group's parity
-      travels with its data.
-    - pacing_s delay between each packet prevents burst-flooding the lwIP recv queue.
+    Packet header (8 bytes):
+      [0xAA, 0xBB, frame_id, tile_id, chunk_id, total_chunks, size_hi, size_lo]
 
-    Data packet header  (8 bytes):
-      [0xAA, 0xBB, frame_id, chunk_id, total_data, total_parity, size_hi, size_lo]
-    Parity packet header (8 bytes):
-      [0xAA, 0xBC, frame_id, group_id, group_start, group_count, 0x00, 0x00]
+    Why tiles beat whole-frame chunking:
+    - A 160x120 tile at quality 70 is ~3-6 KB = 3-5 UDP packets.
+    - Losing 1 packet = 1 tile skips an update (20% of screen for one frame).
+    - Old approach: losing 1 packet = whole frame corrupt (100% screen).
+    - Each tile is independently valid JPEG — no cross-tile dependency.
     """
     global _frame_id
 
     frame_id  = _frame_id & 0xFF
     _frame_id = (_frame_id + 1) & 0xFF
+    dest      = (target_ip, PORT)
 
-    data       = jpeg_bytes
-    total_len  = len(data)
-    num_chunks = (total_len + CHUNK_DATA_SIZE - 1) // CHUNK_DATA_SIZE
-    num_groups = (num_chunks + FEC_GROUP_SIZE - 1) // FEC_GROUP_SIZE
-    num_parity = num_groups
+    for tId in range(NUM_TILES):
+        # Crop tile from full frame
+        x, y   = TILE_X[tId], TILE_Y[tId]
+        tile   = frame_bgr[y:y+TILE_H, x:x+TILE_W]
 
-    size_hi = (total_len >> 8) & 0xFF
-    size_lo = total_len & 0xFF
-    dest    = (target_ip, PORT)
+        # Encode tile to JPEG
+        _, enc = cv2.imencode('.jpg', tile,
+                              [int(cv2.IMWRITE_JPEG_QUALITY), quality,
+                               int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR), sub_flag])
+        jpeg_bytes = enc.tobytes()
+        total_len  = len(jpeg_bytes)
 
-    # Pre-slice all chunk bytes so parity calc doesn't block between sends
-    raw_chunks = [data[i * CHUNK_DATA_SIZE : (i + 1) * CHUNK_DATA_SIZE]
-                  for i in range(num_chunks)]
+        if total_len > MAX_TILE_JPEG:
+            print(f"[WARN] Tile {tId} JPEG {total_len}B exceeds MAX_TILE_JPEG — lower quality")
+            continue
 
-    # ── Interleaved send: data group, then its parity, repeat ─────────────
-    # This is the critical change — parity arrives before the next group's
-    # data, so the receiver can start FEC recovery immediately.
-    for g in range(num_groups):
-        g_start = g * FEC_GROUP_SIZE
-        g_end   = min(g_start + FEC_GROUP_SIZE, num_chunks)
+        # Chunk and send
+        num_chunks = (total_len + CHUNK_DATA_SIZE - 1) // CHUNK_DATA_SIZE
+        size_hi    = (total_len >> 8) & 0xFF
+        size_lo    = total_len & 0xFF
 
-        # Send data chunks for this group
-        for i in range(g_start, g_end):
-            header = bytes([0xAA, 0xBB, frame_id, i,
-                            num_chunks, num_parity, size_hi, size_lo])
-            sock.sendto(header + raw_chunks[i], dest)
+        for cId in range(num_chunks):
+            chunk  = jpeg_bytes[cId * CHUNK_DATA_SIZE : (cId + 1) * CHUNK_DATA_SIZE]
+            header = bytes([0xAA, 0xBB, frame_id, tId, cId, num_chunks, size_hi, size_lo])
+            # Retry on WSAEWOULDBLOCK (WinError 10035) — send buffer temporarily full
+            while True:
+                try:
+                    sock.sendto(header + chunk, dest)
+                    break
+                except BlockingIOError:
+                    time.sleep(0.0005)  # wait 500µs and retry
             if pacing_s > 0:
                 time.sleep(pacing_s)
-
-        # Send this group's parity immediately after its data
-        parity = _xor_parity(raw_chunks[g_start:g_end])
-        header = bytes([0xAA, 0xBC, frame_id, g,
-                        g_start, g_end - g_start, 0x00, 0x00])
-        sock.sendto(header + parity, dest)
-        if pacing_s > 0:
-            time.sleep(pacing_s)
 
 
 # ─────────────────────────────────────────────
@@ -298,10 +278,9 @@ def stream_mss_udp(target_ip: str, monitor_idx: int):
     cv2.createTrackbar("Base Qual",      WINDOW_NAME, 70, 95,       lambda x: None)
     cv2.createTrackbar("Mode FAST/TUNE", WINDOW_NAME, 0,  1,        lambda x: None)
     cv2.createTrackbar("Debug Info",     WINDOW_NAME, 1,  1,        lambda x: None)
-    # Pacing: 0-10 = 0-1000µs inter-packet delay. Start at 3 (300µs).
-    # Increase if you see dropped frames; decrease to maximise throughput.
-    # Each unit = 100µs. Rule of thumb: raise until FPS stabilises, then back off 1.
-    cv2.createTrackbar("Pacing x100us",  WINDOW_NAME, 3,  10,       lambda x: None)
+    # Pacing: 0-10 = 0-1000µs between packets within a tile.
+    # Start at 0, increase only if tiles show corrupt markers.
+    cv2.createTrackbar("Pacing x100us", WINDOW_NAME, 0, 10, lambda x: None)
 
     threading.Thread(target=capture_worker,    args=(monitor_idx,), daemon=True).start()
     threading.Thread(target=background_profiler,                     daemon=True).start()
@@ -323,8 +302,8 @@ def stream_mss_udp(target_ip: str, monitor_idx: int):
             user_qual    = cv2.getTrackbarPos("Base Qual",      WINDOW_NAME)
             current_mode = cv2.getTrackbarPos("Mode FAST/TUNE", WINDOW_NAME)
             debug_state  = cv2.getTrackbarPos("Debug Info",     WINDOW_NAME)
-            pacing_us    = cv2.getTrackbarPos("Pacing x100us",  WINDOW_NAME)
-            pacing_s     = pacing_us * 0.0001  # trackbar units → seconds
+            pacing_us  = cv2.getTrackbarPos("Pacing x100us", WINDOW_NAME)
+            pacing_s   = pacing_us * 0.0001
 
             # Receive stat packets from ESP
             try:
@@ -380,19 +359,16 @@ def stream_mss_udp(target_ip: str, monitor_idx: int):
                         if sub == 420
                         else cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444)
 
-            # Encode – drop quality if somehow still above cap
-            while q_final > 10:
-                _, encoded = cv2.imencode(
-                    '.jpg', resized,
-                    [int(cv2.IMWRITE_JPEG_QUALITY), q_final,
-                     int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR), sub_flag])
-                if len(encoded) <= MAX_FRAME_SIZE: break
-                q_final -= 5
-
-            last_frame_bytes = len(encoded)
-
-            # ── Transmit with FEC ──────────────────────
-            send_frame_with_fec(sock, target_ip, encoded.tobytes(), pacing_s=pacing_s)
+            # ── Transmit as 4 independent tiles ────────
+            # send_tiles handles per-tile JPEG encoding internally.
+            # last_frame_bytes tracks total bytes across all tiles for the UI.
+            send_tiles(sock, target_ip, resized, q_final, sub_flag, pacing_s=pacing_s)
+            # Estimate total bytes for display (approx — each tile ~varies)
+            last_frame_bytes = sum(
+                len(cv2.imencode('.jpg', resized[TILE_Y[t]:TILE_Y[t]+TILE_H,
+                                                 TILE_X[t]:TILE_X[t]+TILE_W],
+                                 [int(cv2.IMWRITE_JPEG_QUALITY), q_final])[1])
+                for t in range(NUM_TILES))
 
             # ── Preview window ─────────────────────────
             preview = cv2.resize(resized, (480, 360), interpolation=cv2.INTER_NEAREST)
@@ -401,21 +377,57 @@ def stream_mss_udp(target_ip: str, monitor_idx: int):
                 overlay = preview.copy()
                 cv2.rectangle(overlay, (0, 0), (480, 360), (0, 0, 0), -1)
                 preview = cv2.addWeighted(overlay, 0.85, preview, 0.15, 0)
-                y = 30
-                for line in latest_esp_log.split('|'):
-                    cv2.putText(preview, line.strip(), (10, y),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
-                    y += 25
+
+                # Parse structured diagnostic fields from ESP stats
+                fields = {}
+                for token in latest_esp_log.split('|'):
+                    if ':' in token:
+                        k, _, v = token.partition(':')
+                        fields[k.strip()] = v.strip()
+
+                # Color-coded diagnostic dashboard
+                # Each field is colored by severity so you can spot issues instantly
+                def diag_color(key, warn_thresh, err_thresh):
+                    try:
+                        v = float(fields.get(key, '0').rstrip('%').rstrip('ms').rstrip('KB'))
+                        if v >= err_thresh:  return (0,   0, 255)  # red   = error
+                        if v >= warn_thresh: return (0, 165, 255)  # orange = warning
+                    except: pass
+                    return (0, 255, 0)   # green  = ok
+
+                # Parse per-tile stats: T0:ok=N,c=N,to=N
+                def tile_stat(t):
+                    raw = fields.get(f'T{t}','ok=?,c=?,to=?')
+                    kv  = dict(s.split('=') for s in raw.split(',') if '=' in s)
+                    ok  = kv.get('ok','?'); c = kv.get('c','?'); to = kv.get('to','?')
+                    col = (0,255,0) if c=='0' and to=='0' else (0,165,255) if c=='0' else (0,0,255)
+                    return f"T{t}[TL TR BL BR][{t}] ok={ok} corrupt={c} timeout={to}", col
+
+                dashboard = [
+                    (f"FPS:    {fields.get('FPS','?'):>6}",           (0,255,0)),
+                    (f"Jitter: {fields.get('JIT','?'):>6}",           diag_color('JIT', 10, 30)),
+                    (f"DRAM:   {fields.get('DRAM','?'):>6}",          (0,255,0)),
+                    (f"PSRAM:  {fields.get('PSRAM','?'):>6}",         (0,255,0)),
+                    (f"Pkts:   {fields.get('PKTS','?'):>6}",          (0,255,0)),
+                    ("── per tile (ok / corrupt / timeout) ──",       (100,100,100)),
+                    (f"TL: {fields.get('T0','?')}",                   diag_color('T0',1,1)),
+                    (f"TR: {fields.get('T1','?')}",                   diag_color('T1',1,1)),
+                    (f"BL: {fields.get('T2','?')}",                   diag_color('T2',1,1)),
+                    (f"BR: {fields.get('T3','?')}",                   diag_color('T3',1,1)),
+                ]
+                y = 20
+                for text, color in dashboard:
+                    cv2.putText(preview, text, (10, y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 1)
+                    y += 22
             else:
-                num_chunks = (last_frame_bytes + CHUNK_DATA_SIZE - 1) // CHUNK_DATA_SIZE
-                num_par    = (num_chunks + FEC_GROUP_SIZE - 1) // FEC_GROUP_SIZE
-                total_tx_ms = (num_chunks + num_par) * pacing_us * 0.1
-                info = (f"{last_frame_bytes}B | {num_chunks}d+{num_par}p | "
+                per_tile = last_frame_bytes // NUM_TILES
+                pkts_per = (per_tile + CHUNK_DATA_SIZE - 1) // CHUNK_DATA_SIZE
+                info = (f"Total:{last_frame_bytes}B  PerTile:~{per_tile}B/{pkts_per}pkts "
                         f"Q:{q_final} Sub:{sub} Pace:{pacing_us*100}us "
-                        f"TxT:{total_tx_ms:.1f}ms "
                         f"{'[Tune]' if current_mode else '[Fast]'}")
                 cv2.putText(preview, info, (10, 350),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1)
 
             cv2.imshow(WINDOW_NAME, preview)
 
@@ -444,7 +456,7 @@ def quick_find_esp(timeout=5.0) -> str | None:
     print(f"[*] Waiting {timeout}s for ESP32 beacon on port {PORT}…")
     try:
         data, addr = s.recvfrom(128)
-        if b"IM HERE" in data:
+        if b"ESP32_READY" in data:
             print(f"[*] Found ESP32 at {addr[0]}")
             return addr[0]
     except socket.timeout:
