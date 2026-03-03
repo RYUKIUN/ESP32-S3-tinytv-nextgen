@@ -159,6 +159,8 @@ static uint16_t* tileFb[NUM_TILES] = { nullptr, nullptr, nullptr, nullptr };
  //  32-bit aligned → single-instruction read/write on LX7, no tearing.
  // ─────────────────────────────────────────────
  static volatile uint32_t g_avgDecodeUs = 0;  // avg tile decode µs (excl. pushImage)
+static volatile uint32_t g_presentedFrames = 0; // count of fully-presented frames (all 4 tiles pushed)
+static volatile uint32_t g_abortedFrames   = 0; // frameId switched before completing 4 tiles (UDP reorder/overrun)
  
  // ─────────────────────────────────────────────
  //  GLOBAL STATE
@@ -434,18 +436,26 @@ static uint16_t* tileFb[NUM_TILES] = { nullptr, nullptr, nullptr, nullptr };
              resetTile(tId);
          }
  
-         // ── Periodic stat report ─────────────────────────────────────────
-         if (debugEnabled && g_remoteAddrValid && (millis() - lastStatMs) > 1000) {
-             uint32_t el = millis() - lastStatMs;
- 
-             // FPS: sum decoded tiles / 4 tiles per frame / elapsed seconds
-             uint32_t totalDec = 0;
-             uint32_t totalDrop = 0;
-             for (int i = 0; i < NUM_TILES; i++) {
-                 totalDec  += tiles[i].stat_decoded;
-                 totalDrop += tiles[i].stat_corrupt + tiles[i].stat_timeout;
-             }
-             float fps = (totalDec / 4.0f) / (el / 1000.0f);
+        // ── Periodic stat report ─────────────────────────────────────────
+        if (debugEnabled && g_remoteAddrValid && (millis() - lastStatMs) > 1000) {
+            uint32_t el = millis() - lastStatMs;
+
+            // FPS: count frames actually presented to LCD (matches "appearance fps")
+            static uint32_t lastPresented = 0;
+            uint32_t nowPresented = g_presentedFrames;  // 32-bit aligned volatile read
+            uint32_t frames = nowPresented - lastPresented;
+            lastPresented = nowPresented;
+            float fps = frames / (el / 1000.0f);
+
+            // Drops: corrupt + timeout (tile-level). Aborted: partial frames discarded due to frameId switch.
+            uint32_t totalDrop = 0;
+            for (int i = 0; i < NUM_TILES; i++) {
+                totalDrop += tiles[i].stat_corrupt + tiles[i].stat_timeout;
+            }
+            static uint32_t lastAborted = 0;
+            uint32_t nowAborted = g_abortedFrames;
+            uint32_t aborted = nowAborted - lastAborted;
+            lastAborted = nowAborted;
  
              // Memory
              uint32_t freeSRAM  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
@@ -459,12 +469,12 @@ static uint16_t* tileFb[NUM_TILES] = { nullptr, nullptr, nullptr, nullptr };
              // Decode time from Core 1 (volatile read — 32-bit aligned, atomic on LX7)
              uint32_t decUs = g_avgDecodeUs;
  
-             snprintf(debugBuf, sizeof(debugBuf),
-                 "%c%cFPS:%.1f|TEMP:%.1f|JIT:%.1f|DEC:%lu|DROP:%lu"
-                 "|SRAM:%lu/%lu|PSRAM:%lu/%lu",
+            snprintf(debugBuf, sizeof(debugBuf),
+                "%c%cFPS:%.1f|TEMP:%.1f|JIT:%.1f|DEC:%lu|DROP:%lu|ABRT:%lu"
+                "|SRAM:%lu/%lu|PSRAM:%lu/%lu",
                  0xAB, 0xCD,
                  fps, tempC, stat_jitter,
-                 decUs, totalDrop,
+                decUs, totalDrop, aborted,
                  freeSRAM / 1024, totalSRAM / 1024,
                  freePSR  / 1024, totalPSR  / 1024);
  
@@ -654,7 +664,12 @@ static uint16_t* tileFb[NUM_TILES] = { nullptr, nullptr, nullptr, nullptr };
     }
 
     // New frameId => start collecting tiles for that frame.
+    // If we had partial tiles for a previous frame, count it as an aborted frame
+    // (usually due to UDP reorder/overrun) since it will never be presented.
     if (pendingFrame == 0xFF || msg.frameId != pendingFrame) {
+        if (pendingFrame != 0xFF && readyMask != 0) {
+            g_abortedFrames++;
+        }
         pendingFrame = msg.frameId;
         readyMask    = 0;
         frameStartMs = millis();
@@ -698,6 +713,7 @@ static uint16_t* tileFb[NUM_TILES] = { nullptr, nullptr, nullptr, nullptr };
             for (int t = 0; t < NUM_TILES; t++) {
                 lcd.pushImage(TILE_X[t], TILE_Y[t], TILE_W, TILE_H, tileFb[t]);
             }
+            g_presentedFrames++;
             readyMask    = 0;
             pendingFrame = 0xFF;
             frameStartMs = 0;

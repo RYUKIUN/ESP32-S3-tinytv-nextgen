@@ -193,8 +193,9 @@ def send_tiles(sock: socket.socket, target_ip: str, frame_bgr: np.ndarray,
                 except BlockingIOError:
                     time.sleep(0.0005)
 
-            if pacing_s > 0:
-                time.sleep(pacing_s)
+        # Optional pacing once per tile (not per packet)
+        if pacing_s > 0:
+            time.sleep(pacing_s)
 
     return total_bytes
 
