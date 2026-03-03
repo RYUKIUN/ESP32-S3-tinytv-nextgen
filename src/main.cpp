@@ -85,6 +85,11 @@
  // ─────────────────────────────────────────────
  //  CONFIG
  // ─────────────────────────────────────────────
+// Set to 1 to use USB CDC bulk transfer instead of UDP WiFi.
+// USB mode ignores WiFi/UDP and reads the same tile-chunk packets
+// over Serial as a byte stream.
+#define USE_USB_STREAM 1
+
  const char* WIFI_SSID  = "streaming";
  const char* WIFI_PASS  = "12345678";
  const int   UDP_PORT   = 12345;
@@ -303,184 +308,292 @@ static uint16_t* tileFb[NUM_TILES] = { nullptr, nullptr, nullptr, nullptr };
      return true;
  }
  
- // ─────────────────────────────────────────────
- //  NETWORK TASK  (Core 0)
- // ─────────────────────────────────────────────
- // Packet format:
- //   Data:    [0xAA 0xBB frameId tileId chunkId totalChunks sizeHi sizeLo] + payload
- //   Control: [0xAA 0xCC 0x01 debugState]
- //
- // Pipeline flow when tile completes:
- //   1. xSemaphoreTake(slotFree[back])     — wait for renderer to vacate slot
- //   2. assembleTileInto(tId, slot[back])  — PSRAM chunks → SRAM assembly
- //   3. xQueueSend(decodeQueue, &msg)      — block until renderer is ready
- //   4. back ^= 1
- static IRAM_ATTR void networkTask(void*) {
-     g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-     if (g_sock < 0) { Serial.println("[NET] socket fail"); vTaskDelete(NULL); return; }
- 
-     int rcvbuf = 65536;
-     setsockopt(g_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
- 
-     struct sockaddr_in local = {};
-     local.sin_family = AF_INET;
-     local.sin_port   = htons(UDP_PORT);
-     local.sin_addr.s_addr = INADDR_ANY;
-     if (bind(g_sock, (struct sockaddr*)&local, sizeof(local)) < 0) {
-         Serial.println("[NET] bind fail"); close(g_sock); vTaskDelete(NULL); return;
-     }
-     fcntl(g_sock, F_SETFL, O_NONBLOCK);
-     Serial.printf("[NET] UDP ready port=%d\n", UDP_PORT);
- 
-     // rxBuf is static — avoids stack pressure (stack budgeted at 10 KB)
-     static uint8_t rxBuf[CHUNK_DATA_SIZE + 16];
-     struct sockaddr_in sender;
-     socklen_t slen = sizeof(sender);
-     uint32_t  lastPktMs = millis(), lastBeaconMs = 0, lastStatMs = 0, pktCount = 0;
-     uint8_t   back = 0;
- 
-     while (true) {
-         int n = recvfrom(g_sock, rxBuf, sizeof(rxBuf), 0,
-                          (struct sockaddr*)&sender, &slen);
- 
-         if (n < 0) {
-             // 1 ms select — responsive first-packet detection, no wasted 5 ms sleeps
-             fd_set rfds; FD_ZERO(&rfds); FD_SET(g_sock, &rfds);
-             struct timeval tv = { .tv_sec = 0, .tv_usec = 1000 };
-             select(g_sock + 1, &rfds, NULL, NULL, &tv);
- 
-             // Beacon if no traffic for 2 s
-             if ((millis()-lastBeaconMs) > 2000 && (millis()-lastPktMs) > 2000) {
-                 struct sockaddr_in bc = {};
-                 bc.sin_family = AF_INET;
-                 bc.sin_port   = htons(UDP_PORT);
-                 bc.sin_addr.s_addr = htonl(INADDR_BROADCAST);
-                 int so = 1;
-                 setsockopt(g_sock, SOL_SOCKET, SO_BROADCAST, &so, sizeof(so));
-                 const char* b = "ESP32_READY";
-                 sendto(g_sock, b, strlen(b), 0, (struct sockaddr*)&bc, sizeof(bc));
-                 lastBeaconMs = millis();
-             }
-             continue;
-         }
- 
-         lastPktMs = millis(); pktCount++;
-         if (n < 4 || rxBuf[0] != 0xAA) { portYIELD(); continue; }
-         memcpy(&g_remoteAddr, &sender, sizeof(sender));
-         g_remoteAddrValid = true;
- 
-         // ── Control packet ────────────────────────────────────────────────
-         if (rxBuf[1] == 0xCC) {
-             if (n >= 4 && rxBuf[2] == 0x01) debugEnabled = (rxBuf[3] == 1);
-             portYIELD(); continue;
-         }
- 
-         // ── Tile data chunk ───────────────────────────────────────────────
-         if (rxBuf[1] != 0xBB || n < 8) { portYIELD(); continue; }
-         uint8_t  fId     = rxBuf[2];
-         uint8_t  tId     = rxBuf[3];
-         uint8_t  cId     = rxBuf[4];
-         uint8_t  nChunks = rxBuf[5];
-         uint16_t fSize   = ((uint16_t)rxBuf[6] << 8) | rxBuf[7];
-         int      dataLen = n - 8;
-         if (tId >= NUM_TILES || dataLen <= 0) { portYIELD(); continue; }
- 
-         TileState& ts = tiles[tId];
- 
-         // Timeout stale reassembly
-         if (ts.firstChunkMs > 0 && (millis() - ts.firstChunkMs) > TILE_TIMEOUT_MS) {
-             Serial.printf("[TILE%u] timeout got=%u/%u\n", tId, ts.chunksGot, ts.totalChunks);
-             ts.stat_timeout++;
-             resetTile(tId);
-         }
- 
-         // New frame for this tile
-         if (fId != ts.frameId) {
-             resetTile(tId);
-             ts.frameId     = fId;
-             ts.totalChunks = nChunks;
-             ts.frameSize   = fSize;
-             ts.firstChunkMs = millis();
-         }
- 
-         // Store chunk into PSRAM staging area
-         if (cId < MAX_TILE_CHUNKS && !ts.chunkGot[cId]) {
-             memcpy(ts.chunkBuf[cId], &rxBuf[8], dataLen);
-             ts.chunkLen[cId] = (uint16_t)dataLen;
-             ts.chunkGot[cId] = true;
-             ts.chunksGot++;
-         }
- 
-         // All chunks received → feed the pipeline
-         if (ts.chunksGot >= ts.totalChunks) {
- 
-             // Wait for renderer to vacate the slot we're about to fill.
-             // In steady state returns immediately — renderer finished while
-             // we were receiving this tile's remaining chunks.
-             xSemaphoreTake(slotFree[back], portMAX_DELAY);
- 
-             int len = assembleTileInto(tId, slot[back].assembly);
- 
-             if (len > 0) {
+// ─────────────────────────────────────────────
+//  STATS HELPER  (shared by UDP and USB modes)
+// ─────────────────────────────────────────────
+static IRAM_ATTR void buildStatsString() {
+    uint32_t el = 1000;  // dummy if never called with real elapsed
+
+    // FPS: sum decoded tiles / 4 tiles per frame / elapsed seconds
+    uint32_t totalDec = 0;
+    uint32_t totalDrop = 0;
+    for (int i = 0; i < NUM_TILES; i++) {
+        totalDec  += tiles[i].stat_decoded;
+        totalDrop += tiles[i].stat_corrupt + tiles[i].stat_timeout;
+    }
+    float fps = (float)totalDec / 4.0f;  // caller should divide by real seconds
+
+    // Memory
+    uint32_t freeSRAM  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    uint32_t totalSRAM = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
+    uint32_t freePSR   = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    uint32_t totalPSR  = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+
+    // Temperature (Arduino ESP32 built-in, no extra driver needed)
+    float tempC = temperatureRead();
+
+    // Decode time from Core 1 (volatile read — 32-bit aligned, atomic on LX7)
+    uint32_t decUs = g_avgDecodeUs;
+
+    snprintf(debugBuf, sizeof(debugBuf),
+        "%c%cFPS:%.1f|TEMP:%.1f|JIT:%.1f|DEC:%lu|DROP:%lu"
+        "|SRAM:%lu/%lu|PSRAM:%lu/%lu",
+        0xAB, 0xCD,
+        fps, tempC, stat_jitter,
+        decUs, totalDrop,
+        freeSRAM / 1024, totalSRAM / 1024,
+        freePSR  / 1024, totalPSR  / 1024);
+}
+
+// ─────────────────────────────────────────────
+//  NETWORK TASK  (Core 0, UDP mode)
+// ─────────────────────────────────────────────
+// Packet format:
+//   Data:    [0xAA 0xBB frameId tileId chunkId totalChunks sizeHi sizeLo] + payload
+//   Control: [0xAA 0xCC 0x01 debugState]
+//
+// Pipeline flow when tile completes:
+//   1. xSemaphoreTake(slotFree[back])     — wait for renderer to vacate slot
+//   2. assembleTileInto(tId, slot[back])  — PSRAM chunks → SRAM assembly
+//   3. xQueueSend(decodeQueue, &msg)      — block until renderer is ready
+//   4. back ^= 1
+#if !USE_USB_STREAM
+static IRAM_ATTR void networkTask(void*) {
+    g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (g_sock < 0) { Serial.println("[NET] socket fail"); vTaskDelete(NULL); return; }
+
+    int rcvbuf = 65536;
+    setsockopt(g_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+    struct sockaddr_in local = {};
+    local.sin_family = AF_INET;
+    local.sin_port   = htons(UDP_PORT);
+    local.sin_addr.s_addr = INADDR_ANY;
+    if (bind(g_sock, (struct sockaddr*)&local, sizeof(local)) < 0) {
+        Serial.println("[NET] bind fail"); close(g_sock); vTaskDelete(NULL); return;
+    }
+    fcntl(g_sock, F_SETFL, O_NONBLOCK);
+    Serial.printf("[NET] UDP ready port=%d\n", UDP_PORT);
+
+    static uint8_t rxBuf[CHUNK_DATA_SIZE + 16];
+    struct sockaddr_in sender;
+    socklen_t slen = sizeof(sender);
+    uint32_t  lastPktMs = millis(), lastBeaconMs = 0, lastStatMs = millis(), pktCount = 0;
+    uint8_t   back = 0;
+
+    while (true) {
+        int n = recvfrom(g_sock, rxBuf, sizeof(rxBuf), 0,
+                         (struct sockaddr*)&sender, &slen);
+
+        if (n < 0) {
+            fd_set rfds; FD_ZERO(&rfds); FD_SET(g_sock, &rfds);
+            struct timeval tv = { .tv_sec = 0, .tv_usec = 1000 };
+            select(g_sock + 1, &rfds, NULL, NULL, &tv);
+
+            if ((millis()-lastBeaconMs) > 2000 && (millis()-lastPktMs) > 2000) {
+                struct sockaddr_in bc = {};
+                bc.sin_family = AF_INET;
+                bc.sin_port   = htons(UDP_PORT);
+                bc.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+                int so = 1;
+                setsockopt(g_sock, SOL_SOCKET, SO_BROADCAST, &so, sizeof(so));
+                const char* b = "ESP32_READY";
+                sendto(g_sock, b, strlen(b), 0, (struct sockaddr*)&bc, sizeof(bc));
+                lastBeaconMs = millis();
+            }
+            continue;
+        }
+
+        lastPktMs = millis(); pktCount++;
+        if (n < 4 || rxBuf[0] != 0xAA) { portYIELD(); continue; }
+        memcpy(&g_remoteAddr, &sender, sizeof(sender));
+        g_remoteAddrValid = true;
+
+        if (rxBuf[1] == 0xCC) {
+            if (n >= 4 && rxBuf[2] == 0x01) debugEnabled = (rxBuf[3] == 1);
+            portYIELD(); continue;
+        }
+
+        if (rxBuf[1] != 0xBB || n < 8) { portYIELD(); continue; }
+        uint8_t  fId     = rxBuf[2];
+        uint8_t  tId     = rxBuf[3];
+        uint8_t  cId     = rxBuf[4];
+        uint8_t  nChunks = rxBuf[5];
+        uint16_t fSize   = ((uint16_t)rxBuf[6] << 8) | rxBuf[7];
+        int      dataLen = n - 8;
+        if (tId >= NUM_TILES || dataLen <= 0) { portYIELD(); continue; }
+
+        TileState& ts = tiles[tId];
+
+        if (ts.firstChunkMs > 0 && (millis() - ts.firstChunkMs) > TILE_TIMEOUT_MS) {
+            Serial.printf("[TILE%u] timeout got=%u/%u\n", tId, ts.chunksGot, ts.totalChunks);
+            ts.stat_timeout++;
+            resetTile(tId);
+        }
+
+        if (fId != ts.frameId) {
+            resetTile(tId);
+            ts.frameId     = fId;
+            ts.totalChunks = nChunks;
+            ts.frameSize   = fSize;
+            ts.firstChunkMs = millis();
+        }
+
+        if (cId < MAX_TILE_CHUNKS && !ts.chunkGot[cId]) {
+            memcpy(ts.chunkBuf[cId], &rxBuf[8], dataLen);
+            ts.chunkLen[cId] = (uint16_t)dataLen;
+            ts.chunkGot[cId] = true;
+            ts.chunksGot++;
+        }
+
+        if (ts.chunksGot >= ts.totalChunks) {
+            xSemaphoreTake(slotFree[back], portMAX_DELAY);
+            int len = assembleTileInto(tId, slot[back].assembly);
+
+            if (len > 0) {
                 DecodeMsg msg = { fId, tId, back, (uint16_t)len };
-                 xQueueSend(decodeQueue, &msg, portMAX_DELAY);
-                 back ^= 1;
-             } else {
-                 // Corrupt JPEG: slot was never used — return semaphore immediately
-                 xSemaphoreGive(slotFree[back]);
-                 // stat_corrupt already incremented inside assembleTileInto
-             }
- 
-             resetTile(tId);
-         }
- 
-         // ── Periodic stat report ─────────────────────────────────────────
-         if (debugEnabled && g_remoteAddrValid && (millis() - lastStatMs) > 1000) {
-             uint32_t el = millis() - lastStatMs;
- 
-             // FPS: sum decoded tiles / 4 tiles per frame / elapsed seconds
-             uint32_t totalDec = 0;
-             uint32_t totalDrop = 0;
-             for (int i = 0; i < NUM_TILES; i++) {
-                 totalDec  += tiles[i].stat_decoded;
-                 totalDrop += tiles[i].stat_corrupt + tiles[i].stat_timeout;
-             }
-             float fps = (totalDec / 4.0f) / (el / 1000.0f);
- 
-             // Memory
-             uint32_t freeSRAM  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-             uint32_t totalSRAM = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
-             uint32_t freePSR   = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-             uint32_t totalPSR  = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
- 
-             // Temperature (Arduino ESP32 built-in, no extra driver needed)
-             float tempC = temperatureRead();
- 
-             // Decode time from Core 1 (volatile read — 32-bit aligned, atomic on LX7)
-             uint32_t decUs = g_avgDecodeUs;
- 
-             snprintf(debugBuf, sizeof(debugBuf),
-                 "%c%cFPS:%.1f|TEMP:%.1f|JIT:%.1f|DEC:%lu|DROP:%lu"
-                 "|SRAM:%lu/%lu|PSRAM:%lu/%lu",
-                 0xAB, 0xCD,
-                 fps, tempC, stat_jitter,
-                 decUs, totalDrop,
-                 freeSRAM / 1024, totalSRAM / 1024,
-                 freePSR  / 1024, totalPSR  / 1024);
- 
-             sendto(g_sock, debugBuf, strlen(debugBuf), 0,
-                    (struct sockaddr*)&g_remoteAddr, sizeof(g_remoteAddr));
- 
-             // Reset per-window counters
-             for (int i = 0; i < NUM_TILES; i++)
-                 tiles[i].stat_decoded = tiles[i].stat_corrupt = tiles[i].stat_timeout = 0;
-             pktCount = 0;
-             lastStatMs = millis();
-         }
- 
-         portYIELD();
-     }
- }
+                xQueueSend(decodeQueue, &msg, portMAX_DELAY);
+                back ^= 1;
+            } else {
+                xSemaphoreGive(slotFree[back]);
+            }
+
+            resetTile(tId);
+        }
+
+        if (debugEnabled && g_remoteAddrValid && (millis() - lastStatMs) > 1000) {
+            uint32_t el = millis() - lastStatMs;
+
+            buildStatsString();
+
+            sendto(g_sock, debugBuf, strlen(debugBuf), 0,
+                   (struct sockaddr*)&g_remoteAddr, sizeof(g_remoteAddr));
+
+            for (int i = 0; i < NUM_TILES; i++)
+                tiles[i].stat_decoded = tiles[i].stat_corrupt = tiles[i].stat_timeout = 0;
+            pktCount = 0;
+            lastStatMs = millis();
+        }
+
+        portYIELD();
+    }
+}
+#endif  // !USE_USB_STREAM
+
+// ─────────────────────────────────────────────
+//  USB TASK  (Core 0, USB bulk mode)
+// ─────────────────────────────────────────────
+// Reads the same tile-chunk packets as UDP mode, but from Serial byte stream.
+#if USE_USB_STREAM
+static IRAM_ATTR void usbTask(void*) {
+    Serial.println("[USB] Waiting for host...");
+    while (!Serial) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    Serial.println("[USB] Host connected, starting stream.");
+
+    uint8_t  hdr[8];
+    uint32_t lastStatMs = millis();
+
+    while (true) {
+        // Read 8-byte header
+        int got = 0;
+        while (got < 8) {
+            int b = Serial.read();
+            if (b < 0) { vTaskDelay(pdMS_TO_TICKS(1)); continue; }
+            hdr[got++] = (uint8_t)b;
+        }
+
+        if (hdr[0] != 0xAA || hdr[1] != 0xBB) {
+            continue;
+        }
+
+        uint8_t  fId     = hdr[2];
+        uint8_t  tId     = hdr[3];
+        uint8_t  cId     = hdr[4];
+        uint8_t  nChunks = hdr[5];
+        uint16_t fSize   = ((uint16_t)hdr[6] << 8) | hdr[7];
+
+        if (tId >= NUM_TILES || nChunks == 0 || cId >= nChunks) {
+            continue;
+        }
+
+        int dataLen;
+        if (cId < (uint8_t)(nChunks - 1)) {
+            dataLen = CHUNK_DATA_SIZE;
+        } else {
+            int usedByPrev = (int)(nChunks - 1) * CHUNK_DATA_SIZE;
+            dataLen = (int)fSize - usedByPrev;
+            if (dataLen <= 0 || dataLen > CHUNK_DATA_SIZE) continue;
+        }
+
+        TileState& ts = tiles[tId];
+
+        if (ts.firstChunkMs > 0 && (millis() - ts.firstChunkMs) > TILE_TIMEOUT_MS) {
+            Serial.printf("[TILE%u] timeout got=%u/%u\n", tId, ts.chunksGot, ts.totalChunks);
+            ts.stat_timeout++;
+            resetTile(tId);
+        }
+
+        if (fId != ts.frameId) {
+            resetTile(tId);
+            ts.frameId     = fId;
+            ts.totalChunks = nChunks;
+            ts.frameSize   = fSize;
+            ts.firstChunkMs = millis();
+        }
+
+        if (cId < MAX_TILE_CHUNKS && !ts.chunkGot[cId]) {
+            uint8_t* dst = ts.chunkBuf[cId];
+            int gotPayload = 0;
+            while (gotPayload < dataLen) {
+                int b = Serial.read();
+                if (b < 0) { vTaskDelay(pdMS_TO_TICKS(1)); continue; }
+                dst[gotPayload++] = (uint8_t)b;
+            }
+            ts.chunkLen[cId] = (uint16_t)dataLen;
+            ts.chunkGot[cId] = true;
+            ts.chunksGot++;
+        } else {
+            // Still need to drain payload bytes for this chunk
+            int drained = 0;
+            while (drained < dataLen) {
+                int b = Serial.read();
+                if (b < 0) { vTaskDelay(pdMS_TO_TICKS(1)); continue; }
+                drained++;
+            }
+        }
+
+        if (ts.chunksGot >= ts.totalChunks) {
+            static uint8_t back = 0;
+            xSemaphoreTake(slotFree[back], portMAX_DELAY);
+
+            int len = assembleTileInto(tId, slot[back].assembly);
+
+            if (len > 0) {
+                DecodeMsg msg = { fId, tId, back, (uint16_t)len };
+                xQueueSend(decodeQueue, &msg, portMAX_DELAY);
+                back ^= 1;
+            } else {
+                xSemaphoreGive(slotFree[back]);
+            }
+
+            resetTile(tId);
+        }
+
+        if (debugEnabled && (millis() - lastStatMs) > 1000) {
+            buildStatsString();
+            Serial.write((const uint8_t*)debugBuf, strlen(debugBuf));
+
+            for (int i = 0; i < NUM_TILES; i++)
+                tiles[i].stat_decoded = tiles[i].stat_corrupt = tiles[i].stat_timeout = 0;
+            lastStatMs = millis();
+        }
+
+        portYIELD();
+    }
+}
+#endif  // USE_USB_STREAM
  
  // ─────────────────────────────────────────────
  //  DISPLAY HELPERS
@@ -594,30 +707,37 @@ static uint16_t* tileFb[NUM_TILES] = { nullptr, nullptr, nullptr, nullptr };
      statusLine(2, "Buffers:", "2-slot SRAM-dec", TFT_GREEN);
  
      // ── WiFi ──────────────────────────────────────────────────────────────
-     statusLine(3, "WiFi:", "Connecting...", TFT_YELLOW);
-     WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.begin(WIFI_SSID, WIFI_PASS);
-     uint32_t ws = millis(); uint8_t tick = 0;
-     while (WiFi.status() != WL_CONNECTED) {
-         delay(250); tick++;
-         char buf[24]; snprintf(buf, sizeof(buf), "Conn%.*s", tick % 5, ".....");
-         statusLine(3, "WiFi:", buf, TFT_YELLOW);
-         if (millis() - ws > 20000) {
-             statusLine(3, "WiFi:", "TIMEOUT!", TFT_RED);
-             delay(3000); ESP.restart();
-         }
-     }
-     esp_wifi_set_ps(WIFI_PS_NONE);
-     String ip = WiFi.localIP().toString();
-     char ipBuf[36]; snprintf(ipBuf, sizeof(ipBuf), "%s (%ddBm)", ip.c_str(), WiFi.RSSI());
-     statusLine(3, "WiFi:", ipBuf, TFT_GREEN);
-     statusLine(4, "UDP:", String(UDP_PORT).c_str(), TFT_CYAN);
-     statusLine(5, "Mode:", "4-tile ping-pong", TFT_CYAN);
-     statusLine(6, "Status:", "Waiting for PC...", TFT_YELLOW);
-     Serial.printf("[OK] WiFi: %s\n", ip.c_str());
- 
-     // 10 KB stack — headroom for debug snprintf + lwIP frames; rxBuf is static
-     xTaskCreatePinnedToCore(networkTask, "NetTask", 10240, NULL, 2, NULL, 0);
-     Serial.println("[OK] Ready.");
+    statusLine(3, "Link:", USE_USB_STREAM ? "USB CDC" : "WiFi...", TFT_YELLOW);
+
+#if USE_USB_STREAM
+    statusLine(4, "Mode:", "USB 4-tile", TFT_CYAN);
+    statusLine(5, "Status:", "Waiting for host...", TFT_YELLOW);
+    xTaskCreatePinnedToCore(usbTask, "UsbTask", 8192, NULL, 2, NULL, 0);
+    Serial.println("[OK] Ready (USB).");
+#else
+    WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.begin(WIFI_SSID, WIFI_PASS);
+    uint32_t ws = millis(); uint8_t tick = 0;
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(250); tick++;
+        char buf[24]; snprintf(buf, sizeof(buf), "Conn%.*s", tick % 5, ".....");
+        statusLine(3, "WiFi:", buf, TFT_YELLOW);
+        if (millis() - ws > 20000) {
+            statusLine(3, "WiFi:", "TIMEOUT!", TFT_RED);
+            delay(3000); ESP.restart();
+        }
+    }
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    String ip = WiFi.localIP().toString();
+    char ipBuf[36]; snprintf(ipBuf, sizeof(ipBuf), "%s (%ddBm)", ip.c_str(), WiFi.RSSI());
+    statusLine(3, "WiFi:", ipBuf, TFT_GREEN);
+    statusLine(4, "UDP:", String(UDP_PORT).c_str(), TFT_CYAN);
+    statusLine(5, "Mode:", "4-tile ping-pong", TFT_CYAN);
+    statusLine(6, "Status:", "Waiting for PC...", TFT_YELLOW);
+    Serial.printf("[OK] WiFi: %s\n", ip.c_str());
+
+    xTaskCreatePinnedToCore(networkTask, "NetTask", 10240, NULL, 2, NULL, 0);
+    Serial.println("[OK] Ready.");
+#endif
  }
  
  // ─────────────────────────────────────────────
