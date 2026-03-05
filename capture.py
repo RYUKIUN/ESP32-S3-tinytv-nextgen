@@ -7,7 +7,6 @@ import os
 import psutil
 import ctypes
 import threading
-import json
 from queue import Queue
 
 # ─────────────────────────────────────────────
@@ -30,18 +29,51 @@ TILE_Y = [  0,   0, 120, 120]
 # Per-tile JPEG size cap — matches MAX_TILE_JPEG in main.cpp
 MAX_TILE_JPEG = 33600            # 24 × 1400
 
-DEFAULT_FPS   = 30
-WINDOW_NAME   = "Stream Control"
-PROFILE_FILE  = "stream_profiles.json"
-SHARP_BIAS    = -0.04
+# UI / trackbar defaults
+WINDOW_NAME          = "Stream Control"
+UI_W, UI_H           = 480, 560      # cv2 window size
+PREVIEW_W, PREVIEW_H = 480, 360      # preview frame size
+DEFAULT_FPS          = 30
+DEFAULT_QUAL         = 30            # Base Qual trackbar default
+DEFAULT_PACING_STEPS = 5             # Pacing trackbar default (5 × 0.2ms = 1ms)
+PACING_MAX_STEPS     = 20            # Pacing trackbar max (20 × 0.2ms = 4ms)
+PACING_STEP_S        = 0.0004        # seconds per pacing step (0.2ms)
+
+# Encoding / fast-mode heuristics
+SHARP_BIAS           = -0.04
+DITHER_AMT           = 2             # dither strength when variance is low
+DITHER_VAR_THRESH    = 15            # variance below which dithering is applied
+SHARP_AMT            = 0.15          # sharpening kernel strength
+SHARP_EDGE_THRESH    = 300           # edge density above which sharpening is applied
+
+# Cursor overlay
+CURSOR_OUTER_R       = 8             # outer ring radius (px)
+CURSOR_INNER_R       = 5             # filled dot radius (px)
+
+# Debug overlay
+DEBUG_OVERLAY_ALPHA    = 0.85        # black overlay opacity in debug view
+DEBUG_SEND_INTERVAL_S  = 0.5         # seconds between debug-toggle UDP sends
+
+# Diagnostic thresholds (warn, err) — used for colour coding in dashboard
+DIAG_FPS_WARN,  DIAG_FPS_ERR   =  15,    10
+DIAG_TEMP_WARN, DIAG_TEMP_ERR  =  70,   85
+DIAG_JIT_WARN,  DIAG_JIT_ERR   =  10,   30
+DIAG_DEC_WARN,  DIAG_DEC_ERR   =  8000, 15000
+DIAG_DROP_WARN, DIAG_DROP_ERR  =  1,    5
+DIAG_SRAM_WARN, DIAG_SRAM_ERR  =  50,   20   # free KB (lower = worse)
+
+# Networking / timing
+ESP_BEACON_TIMEOUT_S = 5.0           # seconds to wait for ESP32 UDP beacon
+SEND_RETRY_SLEEP_S   = 0.0005        # sleep on WSAEWOULDBLOCK before retrying send
+
+# Process priority
+UNIX_NICE_LEVEL = -10                # nice value for high-priority on Linux/macOS
 
 # ─────────────────────────────────────────────
 #  GLOBAL STATE
 # ─────────────────────────────────────────────
 frame_queue     = Queue(maxsize=1)
 settings_lock   = threading.Lock()
-stream_profiles = {}
-current_mode    = 0
 stop_event      = threading.Event()
 _frame_id       = 0              # rolling 0-255 frame counter
 
@@ -65,7 +97,7 @@ def set_high_priority():
     try:
         p = psutil.Process(os.getpid())
         if os.name == 'nt': p.nice(psutil.NORMAL_PRIORITY_CLASS)
-        else:                p.nice(-10)
+        else:                p.nice(UNIX_NICE_LEVEL)
     except: pass
 
 def get_mouse_pos():
@@ -76,27 +108,6 @@ def get_mouse_pos():
         ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
         return pt.x, pt.y
     return 0, 0
-
-# ─────────────────────────────────────────────
-#  PROFILE PERSISTENCE
-# ─────────────────────────────────────────────
-def load_profiles():
-    global stream_profiles
-    if os.path.exists(PROFILE_FILE):
-        try:
-            with open(PROFILE_FILE, 'r') as f:
-                stream_profiles = json.load(f)
-            print(f"[*] Loaded {len(stream_profiles)} profiles.")
-        except: stream_profiles = {}
-
-def save_profiles():
-    with settings_lock:
-        try:
-            with open(PROFILE_FILE, 'w') as f:
-                json.dump(stream_profiles, f, indent=4)
-            print(f"\n[!] Profiles saved → {os.path.abspath(PROFILE_FILE)}")
-        except Exception as e:
-            print(f"Save Error: {e}")
 
 # ─────────────────────────────────────────────
 #  CONTENT ANALYSIS  (lightweight — runs every frame)
@@ -191,108 +202,13 @@ def send_tiles(sock: socket.socket, target_ip: str, frame_bgr: np.ndarray,
                     sock.sendto(_send_view[:8+clen], dest)
                     break
                 except BlockingIOError:
-                    time.sleep(0.0005)
+                    time.sleep(SEND_RETRY_SLEEP_S)
 
         # Optional pacing once per tile (not per packet)
         if pacing_s > 0:
             time.sleep(pacing_s)
 
     return total_bytes
-
-# ─────────────────────────────────────────────
-#  BACKGROUND EXHAUSTIVE PROFILER
-# ─────────────────────────────────────────────
-# Runs every ~10 s in a daemon thread.  Finds the best dither/sharp/sub/quality
-# combination for the current scene type and saves it as a profile.
-#
-# Quality metric: PSNR (replaces SSIM).
-#   PSNR is O(N) — just MSE + log.  No sliding-window convolution.
-#   Normalised to ~0-1 range (÷50) so the scoring arithmetic is identical
-#   to the old SSIM path; sharp_bias / subsampling penalties apply unchanged.
-#
-# Works on a single representative tile (TL) rather than the full frame:
-#   • Smaller array → faster encode/decode per iteration
-#   • MAX_TILE_JPEG is the real constraint the ESP cares about
-#   • All tiles share the same encoding parameters anyway
-def background_profiler():
-    global current_mode
-    while not stop_event.is_set():
-        # Idle for 10 s between profiling runs
-        for _ in range(100):
-            if stop_event.is_set(): return
-            time.sleep(0.1)
-
-        if current_mode == 0 or frame_queue.empty():
-            continue
-
-        raw_frame = frame_queue.get()
-        full      = cv2.resize(raw_frame, (ESP_W, ESP_H), interpolation=cv2.INTER_AREA)
-        key, var, edges = get_scene_key(full)
-
-        # Reference: top-left tile only — representative and fast
-        ref_tile = full[TILE_Y[0]:TILE_Y[0]+TILE_H, TILE_X[0]:TILE_X[0]+TILE_W].copy()
-
-        best_score = -999.0
-        best_cfg   = {"dither": 0, "sharp": 0.0, "sub": 444, "q": 70}
-
-        for d in [0, 2, 4]:
-            for s in [0.0, 0.1, 0.2, 0.3]:
-                for subsampling in [444, 420]:
-                    test_tile = ref_tile.copy()
-
-                    if d > 0:
-                        # Crop noise to tile size for the profiler pass
-                        noise_tile = (STATIC_NOISE[TILE_Y[0]:TILE_Y[0]+TILE_H,
-                                                   TILE_X[0]:TILE_X[0]+TILE_W]
-                                      .astype(np.float32) * (d / 2.0)).astype(np.int8)
-                        test_tile = cv2.add(test_tile, noise_tile, dtype=cv2.CV_8U)
-
-                    if s > 0:
-                        k = np.array([[0, -s, 0],
-                                      [-s, 1 + 4*s, -s],
-                                      [0, -s, 0]])
-                        test_tile = cv2.filter2D(test_tile, -1, k)
-
-                    sub_flag = (cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444
-                                if subsampling == 444
-                                else cv2.IMWRITE_JPEG_SAMPLING_FACTOR_420)
-
-                    # Binary search: highest quality whose JPEG fits MAX_TILE_JPEG
-                    low_q, high_q, found_q = 10, 95, 10
-                    while low_q <= high_q:
-                        mid_q = (low_q + high_q) // 2
-                        _, enc = cv2.imencode('.jpg', test_tile,
-                                             [int(cv2.IMWRITE_JPEG_QUALITY), mid_q,
-                                              int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR), sub_flag])
-                        if len(enc) <= MAX_TILE_JPEG:
-                            found_q = mid_q; low_q = mid_q + 1
-                        else:
-                            high_q  = mid_q - 1
-
-                    # Decode at found quality and score with PSNR
-                    _, final_enc = cv2.imencode('.jpg', test_tile,
-                                               [int(cv2.IMWRITE_JPEG_QUALITY), found_q,
-                                                int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR), sub_flag])
-                    decoded = cv2.imdecode(final_enc, cv2.IMREAD_COLOR)
-
-                    # PSNR normalised to ~0-1 (50 dB ≈ excellent for this display)
-                    visual_score = psnr(ref_tile, decoded) / 50.0
-
-                    # Apply the same biases as before
-                    adjusted = visual_score - (s * SHARP_BIAS)
-                    if subsampling == 420:
-                        adjusted -= 0.02
-
-                    if adjusted > best_score:
-                        best_score = adjusted
-                        best_cfg   = {"dither": d, "sharp": s,
-                                      "sub": subsampling, "q": found_q}
-
-        with settings_lock:
-            stream_profiles[key] = best_cfg
-            print(f"[PROFILE] {key} → D:{best_cfg['dither']} "
-                  f"S:{best_cfg['sharp']} Sub:{best_cfg['sub']} Q:{best_cfg['q']} "
-                  f"(score={best_score:.4f})")
 
 # ─────────────────────────────────────────────
 #  CAPTURE WORKER
@@ -345,8 +261,8 @@ def _sram_color(free_kb_str: str):
     """Colour SRAM/PSRAM free field — warns when headroom is low."""
     try:
         free = float(free_kb_str.split('/')[0])
-        if free < 20:  return (0,   0, 255)
-        if free < 50:  return (0, 165, 255)
+        if free < DIAG_SRAM_ERR:  return (0,   0, 255)
+        if free < DIAG_SRAM_WARN: return (0, 165, 255)
     except: pass
     return (0, 255, 0)
 
@@ -354,24 +270,19 @@ def _sram_color(free_kb_str: str):
 #  STREAM + UI
 # ─────────────────────────────────────────────
 def stream_mss_udp(target_ip: str, monitor_idx: int):
-    global current_mode
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(('0.0.0.0', 0))
     sock.setblocking(False)
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WINDOW_NAME, 480, 560)
-    cv2.createTrackbar("Max FPS",        WINDOW_NAME, DEFAULT_FPS, 60, lambda x: None)
-    cv2.createTrackbar("Base Qual",      WINDOW_NAME, 70, 95,       lambda x: None)
-    cv2.createTrackbar("Mode FAST/TUNE", WINDOW_NAME, 0,  1,        lambda x: None)
-    cv2.createTrackbar("Debug Info",     WINDOW_NAME, 1,  1,        lambda x: None)
-    # Pacing: 0-10 = 0-1000 µs between packets within a tile.
-    # Start at 0, increase if tiles show corrupt-marker errors.
-    cv2.createTrackbar("Pacing x100us", WINDOW_NAME, 0, 10, lambda x: None)
+    cv2.resizeWindow(WINDOW_NAME, UI_W, UI_H)
+    cv2.createTrackbar("Max FPS",       WINDOW_NAME, DEFAULT_FPS,          60,               lambda x: None)
+    cv2.createTrackbar("Base Qual",     WINDOW_NAME, DEFAULT_QUAL,          95,               lambda x: None)
+    cv2.createTrackbar("Pacing x0.2ms", WINDOW_NAME, DEFAULT_PACING_STEPS, PACING_MAX_STEPS, lambda x: None)
+    cv2.createTrackbar("Debug Info",    WINDOW_NAME, 1,                     1,                lambda x: None)
 
-    threading.Thread(target=capture_worker,    args=(monitor_idx,), daemon=True).start()
-    threading.Thread(target=background_profiler,                     daemon=True).start()
+    threading.Thread(target=capture_worker, args=(monitor_idx,), daemon=True).start()
 
     with mss.mss() as sct:
         m = sct.monitors[monitor_idx]
@@ -388,11 +299,10 @@ def stream_mss_udp(target_ip: str, monitor_idx: int):
             t_start = time.perf_counter()
 
             fps          = cv2.getTrackbarPos("Max FPS",        WINDOW_NAME)
-            user_qual    = cv2.getTrackbarPos("Base Qual",      WINDOW_NAME)
-            current_mode = cv2.getTrackbarPos("Mode FAST/TUNE", WINDOW_NAME)
-            debug_state  = cv2.getTrackbarPos("Debug Info",     WINDOW_NAME)
-            pacing_us    = cv2.getTrackbarPos("Pacing x100us",  WINDOW_NAME)
-            pacing_s     = pacing_us * 0.0001
+            user_qual    = cv2.getTrackbarPos("Base Qual",       WINDOW_NAME)
+            pacing_steps = cv2.getTrackbarPos("Pacing x0.2ms",  WINDOW_NAME)
+            debug_state  = cv2.getTrackbarPos("Debug Info",      WINDOW_NAME)
+            pacing_s     = pacing_steps * PACING_STEP_S   # each step = 0.2 ms
 
             # ── Receive stat packets from ESP ───────────────────────────────
             try:
@@ -405,7 +315,7 @@ def stream_mss_udp(target_ip: str, monitor_idx: int):
             except: pass
 
             # ── Send debug toggle (every 500 ms) ───────────────────────────
-            if time.time() - last_debug_send > 0.5:
+            if time.time() - last_debug_send > DEBUG_SEND_INTERVAL_S:
                 sock.sendto(bytes([0xAA, 0xCC, 0x01, debug_state]), (target_ip, PORT))
                 last_debug_send = time.time()
 
@@ -417,26 +327,17 @@ def stream_mss_udp(target_ip: str, monitor_idx: int):
             mx, my = get_mouse_pos()
             rx, ry = mx - m_left, my - m_top
             if 0 <= rx < m_w and 0 <= ry < m_h:
-                cv2.circle(frame, (rx, ry), 8, (255, 255, 255), 2)
-                cv2.circle(frame, (rx, ry), 5, (0,   0, 255),  -1)
+                cv2.circle(frame, (rx, ry), CURSOR_OUTER_R, (255, 255, 255), 2)
+                cv2.circle(frame, (rx, ry), CURSOR_INNER_R, (0,   0, 255),  -1)
 
             resized = cv2.resize(frame, (ESP_W, ESP_H), interpolation=cv2.INTER_AREA)
             key, var, edges = get_scene_key(resized)
 
-            # ── Encoding parameters ────────────────────────────────────────
-            d_amt, s_amt, sub, q_final = 0, 0.0, 444, user_qual
-
-            with settings_lock:
-                if key in stream_profiles:
-                    d_amt   = stream_profiles[key]["dither"]
-                    s_amt   = stream_profiles[key]["sharp"]
-                    sub     = stream_profiles[key]["sub"]
-                    q_final = min(user_qual, stream_profiles[key]["q"])
-
-            if current_mode == 0 or key not in stream_profiles:
-                d_amt = 2    if var   < 15  else 0
-                s_amt = 0.15 if edges > 300 else 0.0
-                sub   = 420
+            # ── Encoding parameters (fast mode always) ────────────────────
+            d_amt   = DITHER_AMT if var   < DITHER_VAR_THRESH  else 0
+            s_amt   = SHARP_AMT  if edges > SHARP_EDGE_THRESH  else 0.0
+            sub     = 420
+            q_final = user_qual
 
             if d_amt > 0:
                 n       = (STATIC_NOISE.astype(np.float32) * (d_amt / 2.0)).astype(np.int8)
@@ -456,31 +357,31 @@ def stream_mss_udp(target_ip: str, monitor_idx: int):
                 sock, target_ip, resized, q_final, sub_flag, pacing_s=pacing_s)
 
             # ── Preview window ──────────────────────────────────────────────
-            preview = cv2.resize(resized, (480, 360), interpolation=cv2.INTER_NEAREST)
+            preview = cv2.resize(resized, (PREVIEW_W, PREVIEW_H), interpolation=cv2.INTER_NEAREST)
             f = latest_esp_stats   # shorthand
 
             if debug_state == 1:
                 overlay = preview.copy()
-                cv2.rectangle(overlay, (0, 0), (480, 360), (0, 0, 0), -1)
-                preview = cv2.addWeighted(overlay, 0.85, preview, 0.15, 0)
+                cv2.rectangle(overlay, (0, 0), (PREVIEW_W, PREVIEW_H), (0, 0, 0), -1)
+                preview = cv2.addWeighted(overlay, DEBUG_OVERLAY_ALPHA, preview, 1.0 - DEBUG_OVERLAY_ALPHA, 0)
 
                 # ── Compact diagnostic dashboard ────────────────────────────
                 # Fields: FPS, TEMP, JIT, DEC, DROP, SRAM (free/total), PSRAM (free/total)
                 dashboard = [
                     (f"FPS  : {f.get('FPS',  '?'):>8}",
-                     _diag_color(f.get('FPS', '0'),  15, 5)),   # warn <15, err <5
+                     _diag_color(f.get('FPS', '0'),  DIAG_FPS_WARN,  DIAG_FPS_ERR)),
 
                     (f"TEMP : {f.get('TEMP', '?'):>7} C",
-                     _diag_color(f.get('TEMP','0'),  70, 85)),  # warn >70, err >85
+                     _diag_color(f.get('TEMP','0'),  DIAG_TEMP_WARN, DIAG_TEMP_ERR)),
 
                     (f"JIT  : {f.get('JIT',  '?'):>7} ms",
-                     _diag_color(f.get('JIT', '0'),  10, 30)),  # warn >10, err >30
+                     _diag_color(f.get('JIT', '0'),  DIAG_JIT_WARN,  DIAG_JIT_ERR)),
 
                     (f"DEC  : {f.get('DEC',  '?'):>7} us",
-                     _diag_color(f.get('DEC', '0'),  8000, 15000)),
+                     _diag_color(f.get('DEC', '0'),  DIAG_DEC_WARN,  DIAG_DEC_ERR)),
 
                     (f"DROP : {f.get('DROP', '?'):>8}",
-                     _diag_color(f.get('DROP','0'),  1, 5)),    # warn >1/s, err >5/s
+                     _diag_color(f.get('DROP','0'),  DIAG_DROP_WARN, DIAG_DROP_ERR)),
 
                     (f"SRAM : {f.get('SRAM',  '?/?' ):>11} KB",
                      _sram_color(f.get('SRAM', '999/1'))),
@@ -498,9 +399,8 @@ def stream_mss_udp(target_ip: str, monitor_idx: int):
                 per_tile  = last_frame_bytes // NUM_TILES if last_frame_bytes else 0
                 pkts_per  = (per_tile + CHUNK_DATA_SIZE - 1) // CHUNK_DATA_SIZE if per_tile else 0
                 info = (f"Total:{last_frame_bytes}B  PerTile:~{per_tile}B/{pkts_per}pkts "
-                        f"Q:{q_final} Sub:{sub} Pace:{pacing_us*100}us "
-                        f"{'[Tune]' if current_mode else '[Fast]'}")
-                cv2.putText(preview, info, (10, 350),
+                        f"Q:{q_final} Sub:{sub} Pace:{pacing_steps * PACING_STEP_S * 1000:.1f}ms [Fast]")
+                cv2.putText(preview, info, (10, PREVIEW_H - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1)
 
             cv2.imshow(WINDOW_NAME, preview)
@@ -513,7 +413,6 @@ def stream_mss_udp(target_ip: str, monitor_idx: int):
         print("\n[!] Interrupted.")
     finally:
         stop_event.set()
-        save_profiles()
         cv2.destroyAllWindows()
         sock.close()
 
@@ -542,10 +441,9 @@ def quick_find_esp(timeout=5.0) -> str | None:
 if __name__ == "__main__":
     set_high_priority()
     set_high_resolution_timer()
-    load_profiles()
 
     # ── Auto-discover or hardcode ──────────────────────
-    ip = quick_find_esp(timeout=5.0)
+    ip = quick_find_esp(timeout=ESP_BEACON_TIMEOUT_S)
     # ip = "192.168.x.x"   # ← uncomment and set if auto-discovery fails
 
     if ip:

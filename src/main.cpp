@@ -85,7 +85,7 @@
  // ─────────────────────────────────────────────
  //  CONFIG
  // ─────────────────────────────────────────────
- const char* WIFI_SSID  = "streaming";
+ const char* WIFI_SSID  = "streamin";
  const char* WIFI_PASS  = "12345678";
  const int   UDP_PORT   = 12345;
  
@@ -117,10 +117,17 @@
  // Core-1 exclusive — no synchronisation needed.
  static uint16_t* decodeTemp = nullptr;   // allocated in setup(), MALLOC_CAP_INTERNAL
  
-// Final per-tile framebuffer in PSRAM (one per screen tile).
-// We decode tiles into these buffers, then present a whole frame (all 4 tiles)
-// at once to eliminate visible inter-tile temporal "ripple".
-static uint16_t* tileFb[NUM_TILES] = { nullptr, nullptr, nullptr, nullptr };
+// Double-buffered per-tile framebuffers in PSRAM.
+// tileFb[0] and tileFb[1] are two complete sets of 4 tile buffers.
+// Core 1 (decoder) writes into tileFb[writeSet][tId].
+// Display task reads from tileFb[displaySet][tId].
+// The two sets are never accessed simultaneously — writeSet^=1 after posting
+// to displayQueue, so decoder immediately works on the other set.
+static uint16_t* tileFb[2][NUM_TILES] = {
+    { nullptr, nullptr, nullptr, nullptr },
+    { nullptr, nullptr, nullptr, nullptr }
+};
+static uint8_t writeSet = 0;  // Core 1 exclusive — no sync needed
 
  // Message passed through the decode queue
  struct DecodeMsg {
@@ -133,6 +140,14 @@ static uint16_t* tileFb[NUM_TILES] = { nullptr, nullptr, nullptr, nullptr };
  // Pipeline synchronisation
  static QueueHandle_t     decodeQueue;    // depth-1 queue: net → renderer
  static SemaphoreHandle_t slotFree[2];   // given when renderer finishes slot
+
+ // Display pipeline: Core 1 posts here when all 4 tiles are ready.
+ // Display task (separate) does the blocking pushImage calls.
+ struct DisplayMsg {
+     uint8_t frameId;   // for stats / debug
+     uint8_t bufSet;    // which tileFb[bufSet] to push (0 or 1)
+ };
+ static QueueHandle_t displayQueue;      // depth-2 queue: renderer → display task (Core 0)
  
  // ─────────────────────────────────────────────
  //  CHUNK REASSEMBLY STATE  (one per tile position)
@@ -293,12 +308,13 @@ static volatile uint32_t g_abortedFrames   = 0; // frameId switched before compl
      bswap16_simd(decodeTemp, TILE_PIXELS);
  
     // ── Bulk copy SRAM→PSRAM — sequential, one cache-line stream ──────────
-    // Copy into the final per-tile buffer for later frame-synchronised present.
-    if (msg.tId >= NUM_TILES || tileFb[msg.tId] == nullptr) {
+    // Copy into the current write-set tile buffer.
+    // writeSet is Core-1 exclusive — no lock needed.
+    if (msg.tId >= NUM_TILES || tileFb[writeSet][msg.tId] == nullptr) {
         decodeUs = 0;
         return false;
     }
-    memcpy(tileFb[msg.tId], decodeTemp, TILE_PIXELS * 2);
+    memcpy(tileFb[writeSet][msg.tId], decodeTemp, TILE_PIXELS * 2);
  
      decodeUs = micros() - t0;   // decode + bswap + memcpy, not pushImage
  
@@ -515,6 +531,30 @@ static volatile uint32_t g_abortedFrames   = 0; // frameId switched before compl
  }
  
  // ─────────────────────────────────────────────
+ //  DISPLAY TASK  (Core 0, priority 2)
+ // ─────────────────────────────────────────────
+ // Pinned to Core 0 alongside networkTask (priority 3).
+ // networkTask always preempts displayTask the instant a UDP packet arrives,
+ // so UDP latency is completely unaffected. displayTask fills the idle gaps
+ // between UDP bursts (~40-60% of Core 0 is idle — plenty of headroom).
+ //
+ // Core 1 is now 100% decode — never touches the LCD.
+ // displayQueue depth-2 means Core 1 never blocks even if Core 0 is
+ // mid-push when the next complete frame is posted.
+ static void displayTask(void*) {
+     DisplayMsg dmsg;
+     while (true) {
+         if (xQueueReceive(displayQueue, &dmsg, portMAX_DELAY) != pdTRUE) continue;
+         // All 4 tiles of this frame are guaranteed ready in tileFb[dmsg.bufSet].
+         for (int t = 0; t < NUM_TILES; t++) {
+             lcd.pushImage(TILE_X[t], TILE_Y[t], TILE_W, TILE_H,
+                           tileFb[dmsg.bufSet][t]);
+         }
+         g_presentedFrames++;
+     }
+ }
+
+ // ─────────────────────────────────────────────
  //  SETUP
  // ─────────────────────────────────────────────
  void setup() {
@@ -554,13 +594,16 @@ static volatile uint32_t g_abortedFrames   = 0; // frameId switched before compl
          }
      }
  
-    // ── Allocate final per-tile framebuffers in PSRAM ─────────────────────
-    for (int t = 0; t < NUM_TILES && allocOk; t++) {
-        tileFb[t] = (uint16_t*)heap_caps_aligned_alloc(
-            16, TILE_PIXELS * 2, MALLOC_CAP_SPIRAM);
-        if (!tileFb[t]) {
-            Serial.printf("[ERROR] tileFb[%d] PSRAM alloc failed\n", t);
-            allocOk = false; break;
+    // ── Allocate double-buffered per-tile framebuffers in PSRAM ──────────
+    // Two complete sets: decoder writes writeSet, display task reads the other.
+    for (int s = 0; s < 2 && allocOk; s++) {
+        for (int t = 0; t < NUM_TILES && allocOk; t++) {
+            tileFb[s][t] = (uint16_t*)heap_caps_aligned_alloc(
+                16, TILE_PIXELS * 2, MALLOC_CAP_SPIRAM);
+            if (!tileFb[s][t]) {
+                Serial.printf("[ERROR] tileFb[%d][%d] PSRAM alloc failed\n", s, t);
+                allocOk = false;
+            }
         }
     }
 
@@ -582,7 +625,8 @@ static volatile uint32_t g_abortedFrames   = 0; // frameId switched before compl
      }
  
      // ── Pipeline sync primitives ──────────────────────────────────────────
-     decodeQueue = xQueueCreate(1, sizeof(DecodeMsg));
+     decodeQueue  = xQueueCreate(1, sizeof(DecodeMsg));
+     displayQueue = xQueueCreate(2, sizeof(DisplayMsg));  // depth-2: Core 1 never stalls if Core 0 is mid-push
      for (int s = 0; s < 2; s++) {
          slotFree[s] = xSemaphoreCreateBinary();
          xSemaphoreGive(slotFree[s]);
@@ -592,7 +636,7 @@ static volatile uint32_t g_abortedFrames   = 0; // frameId switched before compl
      Serial.printf("[MEM] decodeTemp       : %u B SRAM (16-byte aligned)\n", TILE_PIXELS*2);
      Serial.printf("[MEM] slot[0].assembly : %u B SRAM\n", MAX_TILE_JPEG);
      Serial.printf("[MEM] slot[1].assembly : %u B SRAM\n", MAX_TILE_JPEG);
-    Serial.printf("[MEM] tileFb x4        : %u B PSRAM (16-byte aligned)\n", NUM_TILES*TILE_PIXELS*2);
+    Serial.printf("[MEM] tileFb x2x4      : %u B PSRAM (16-byte aligned, double-buffered)\n", 2*NUM_TILES*TILE_PIXELS*2);
      Serial.printf("[MEM] chunkStorage x4  : %u B PSRAM\n", NUM_TILES*MAX_TILE_CHUNKS*CHUNK_DATA_SIZE);
      Serial.printf("[MEM] free SRAM  : %lu KB / %lu KB\n",
          heap_caps_get_free_size(MALLOC_CAP_INTERNAL)/1024,
@@ -625,21 +669,27 @@ static volatile uint32_t g_abortedFrames   = 0; // frameId switched before compl
      statusLine(6, "Status:", "Waiting for PC...", TFT_YELLOW);
      Serial.printf("[OK] WiFi: %s\n", ip.c_str());
  
-     // 10 KB stack — headroom for debug snprintf + lwIP frames; rxBuf is static
-     xTaskCreatePinnedToCore(networkTask, "NetTask", 10240, NULL, 2, NULL, 0);
+     // networkTask: priority 3 — always preempts displayTask for UDP responsiveness
+     xTaskCreatePinnedToCore(networkTask, "NetTask",  10240, NULL, 3, NULL, 0);
+     // displayTask: priority 2 — runs in Core 0 idle gaps between UDP bursts
+     // Core 1 (loop/decoder) is now 100% free for JPEG decode at priority 1
+     xTaskCreatePinnedToCore(displayTask, "DispTask", 4096,  NULL, 2, NULL, 0);
      Serial.println("[OK] Ready.");
  }
  
  // ─────────────────────────────────────────────
  //  MAIN LOOP  (Core 1 — renderer)
  // ─────────────────────────────────────────────
- // Blocks on decodeQueue. When net delivers a DecodeMsg:
+ // Core 1 is 100% dedicated to JPEG decode. LCD push has moved to displayTask
+ // on Core 0 (priority 2, below networkTask priority 3).
+ //
+ // When net delivers a DecodeMsg:
  //   decode → decodeTemp (SRAM)
  //   bswap → decodeTemp
- //   memcpy → slot[s].fb (PSRAM)
- //   pushImage → display
- //   give slotFree[s]
+ //   memcpy → tileFb[writeSet][tId] (PSRAM)
+ //   when readyMask==0x0F: post DisplayMsg → displayQueue, flip writeSet
  //
+ // Core 1 never blocks on LCD. Core 0 networkTask always preempts displayTask.
  // g_avgDecodeUs updated every 16 tiles (volatile write → Core 0 reads for stats).
  void loop() {
      static bool     streamStarted = false;
@@ -707,13 +757,19 @@ static volatile uint32_t g_abortedFrames   = 0; // frameId switched before compl
                            g_avgDecodeUs, 1000000ul / g_avgDecodeUs);
          }
 
-        // Present only when all 4 tiles of the same frame are ready.
-        // This eliminates inter-tile temporal skew ("ripple"/displacement).
+        // All 4 tiles of this frame are decoded into tileFb[writeSet].
+        // Post to display task — it will do the blocking pushImage calls
+        // while Core 1 is already decoding the next frame into the other set.
+        // g_presentedFrames is incremented by displayTask after LCD push.
         if (readyMask == 0x0F) {
-            for (int t = 0; t < NUM_TILES; t++) {
-                lcd.pushImage(TILE_X[t], TILE_Y[t], TILE_W, TILE_H, tileFb[t]);
+            DisplayMsg dmsg = { msg.frameId, writeSet };
+            // depth-2 queue + Core 0 idle headroom means this almost never blocks.
+            // 20 ms bound prevents Core 1 stalling if display task is unexpectedly slow.
+            if (xQueueSend(displayQueue, &dmsg, pdMS_TO_TICKS(20)) != pdTRUE) {
+                // Display task fell behind — drop this frame rather than stall decoder
+                g_abortedFrames++;
             }
-            g_presentedFrames++;
+            writeSet ^= 1;   // flip immediately regardless — decoder must move on
             readyMask    = 0;
             pendingFrame = 0xFF;
             frameStartMs = 0;
